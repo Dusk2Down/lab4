@@ -1,0 +1,115 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: lab4-postgres
+    environment:
+      POSTGRES_DB: mockdb
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data:/data
+      - ./configs/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - lab4-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d mockdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: lab4-clickhouse
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin123
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./data:/data
+      - ./configs/clickhouse/init_source.sql:/docker-entrypoint-initdb.d/init_source.sql
+      - ./configs/clickhouse/init_dwh.sql:/docker-entrypoint-initdb.d/init_dwh.sql
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - lab4-network
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user=admin", "--password=admin123", "--query=SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: lab4-trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./configs/trino/catalog:/etc/trino/catalog
+      - ./scripts:/scripts
+    networks:
+      - lab4-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  data-importer:
+    image: python:3.11-slim
+    container_name: lab4-importer
+    volumes:
+      - ./data:/data
+      - ./import_scripts:/import_scripts
+    networks:
+      - lab4-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    command: >
+      sh -c "
+        pip install psycopg2-binary clickhouse-driver &&
+        python /import_scripts/import_postgres.py &&
+        python /import_scripts/import_clickhouse.py &&
+        echo 'Import completed!'
+      "
+
+  # Дополнительный сервис для выполнения Trino скриптов
+  trino-runner:
+    image: trinodb/trino:latest
+    container_name: lab4-trino-runner
+    volumes:
+      - ./configs/trino/catalog:/etc/trino/catalog
+      - ./scripts:/scripts
+    networks:
+      - lab4-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      trino:
+        condition: service_started
+    entrypoint: >
+      sh -c "
+        sleep 30 &&
+        echo 'Running ETL to build star schema...' &&
+        trino --server trino:8080 --client-request-timeout 10m --file /scripts/trino_etl_dwh.sql &&
+        echo 'Running reports generation...' &&
+        trino --server trino:8080 --client-request-timeout 10m --output-format NULL --file /scripts/trino_etl_reports.sql &&
+        echo 'All Trino scripts executed successfully!'
+      "
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+
+networks:
+  lab4-network:
+    driver: bridge
